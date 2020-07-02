@@ -85,6 +85,7 @@ impl Default for EthereumSigningParams {
 
 /// The client used to interact with an Ethereum node through RPC.
 pub struct EthereumRpcClient {
+	params: EthereumConnectionParams,
 	client: Client,
 }
 
@@ -96,7 +97,12 @@ impl EthereumRpcClient {
 		let raw_client = RawClient::new(transport);
 		let client: Client = raw_client.into();
 
-		Self { client }
+		Self { params, client }
+	}
+
+	/// Reconnect to the Ethereum node.
+	pub fn reconnect(self) -> Self {
+		Self::new(self.params)
 	}
 }
 

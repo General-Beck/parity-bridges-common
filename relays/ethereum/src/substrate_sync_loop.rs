@@ -101,6 +101,11 @@ impl SubstrateHeadersSource {
 impl SourceClient<SubstrateHeadersSyncPipeline> for SubstrateHeadersSource {
 	type Error = RpcError;
 
+	fn reconnect(mut self) -> Self {
+		self.client = self.client.reconnect();
+		self
+	}
+
 	async fn best_block_number(&self) -> Result<Number, Self::Error> {
 		Ok(self.client.best_header().await?.number)
 	}
@@ -156,6 +161,11 @@ impl EthereumHeadersTarget {
 #[async_trait]
 impl TargetClient<SubstrateHeadersSyncPipeline> for EthereumHeadersTarget {
 	type Error = RpcError;
+
+	fn reconnect(mut self) -> Self {
+		self.client = self.client.reconnect();
+		self
+	}
 
 	async fn best_header_id(&self) -> Result<SubstrateHeaderId, Self::Error> {
 		self.client.best_substrate_block(self.contract).await

@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity Bridges Common.  If not, see <http://www.gnu.org/licenses/>.
 
-use crate::sync::HeadersSyncParams;
+use crate::sync::{HeadersSync, HeadersSyncParams};
 use crate::sync_types::{HeaderId, HeaderStatus, HeadersSyncPipeline, MaybeConnectionError, QueuedHeader};
 
 use async_trait::async_trait;
@@ -49,6 +49,9 @@ pub trait SourceClient<P: HeadersSyncPipeline>: Sized {
 	/// Type of error this clients returns.
 	type Error: std::fmt::Debug + MaybeConnectionError;
 
+	/// Reconnect to source node.
+	fn reconnect(self) -> Self;
+
 	/// Get best block number.
 	async fn best_block_number(&self) -> Result<P::Number, Self::Error>;
 
@@ -77,6 +80,9 @@ pub trait SourceClient<P: HeadersSyncPipeline>: Sized {
 pub trait TargetClient<P: HeadersSyncPipeline>: Sized {
 	/// Type of error this clients returns.
 	type Error: std::fmt::Debug + MaybeConnectionError;
+
+	/// Reconnect to target node.
+	fn reconnect(self) -> Self;
 
 	/// Returns ID of best header known to the target node.
 	async fn best_header_id(&self) -> Result<HeaderId<P::Hash, P::Number>, Self::Error>;
@@ -110,19 +116,62 @@ pub trait TargetClient<P: HeadersSyncPipeline>: Sized {
 	) -> Result<(HeaderId<P::Hash, P::Number>, bool), Self::Error>;
 }
 
+/// Sync pool error.
+enum Error {
+	/// Connection to source node is broken/lost.
+	Source,
+	/// Connection to target node is broken/lost.
+	Target,
+	/// Fatal error has occured.
+	Fatal,
+}
+
 /// Run headers synchronization.
 pub fn run<P: HeadersSyncPipeline>(
-	source_client: impl SourceClient<P>,
+	mut source_client: impl SourceClient<P>,
 	source_tick: Duration,
-	target_client: impl TargetClient<P>,
+	mut target_client: impl TargetClient<P>,
 	target_tick: Duration,
 	sync_params: HeadersSyncParams,
 ) {
+	let mut sync = HeadersSync::<P>::new(sync_params);
+
+	loop {
+		let result = run_until_error(
+			&source_client,
+			source_tick,
+			&target_client,
+			target_tick,
+			&mut sync,
+		);
+
+		match result {
+			Ok(_) => break,
+			Err(Error::Source) => {
+				async_std::task::block_on(async_std::task::sleep(CONNECTION_ERROR_DELAY));
+				source_client = source_client.reconnect();
+			},
+			Err(Error::Target) => {
+				async_std::task::block_on(async_std::task::sleep(CONNECTION_ERROR_DELAY));
+				target_client = target_client.reconnect();
+			},
+			Err(Error::Fatal) => break,
+		}
+	}
+}
+
+/// Run headers synchronization until some error happens.
+fn run_until_error<P: HeadersSyncPipeline>(
+	source_client: &impl SourceClient<P>,
+	source_tick: Duration,
+	target_client: &impl TargetClient<P>,
+	target_tick: Duration,
+	sync: &mut HeadersSync<P>,
+) -> Result<(), Error> {
 	let mut local_pool = futures::executor::LocalPool::new();
 	let mut progress_context = (Instant::now(), None, None);
 
 	local_pool.run_until(async move {
-		let mut sync = crate::sync::HeadersSync::<P>::new(sync_params);
 		let mut stall_countdown = None;
 		let mut last_update_time = Instant::now();
 
@@ -133,7 +182,6 @@ pub fn run<P: HeadersSyncPipeline>(
 		let source_orphan_header_future = futures::future::Fuse::terminated();
 		let source_extra_future = futures::future::Fuse::terminated();
 		let source_completion_future = futures::future::Fuse::terminated();
-		let source_go_offline_future = futures::future::Fuse::terminated();
 		let source_tick_stream = interval(source_tick).fuse();
 
 		let mut target_client_is_online = false;
@@ -145,7 +193,6 @@ pub fn run<P: HeadersSyncPipeline>(
 		let target_existence_status_future = futures::future::Fuse::terminated();
 		let target_submit_header_future = futures::future::Fuse::terminated();
 		let target_complete_header_future = futures::future::Fuse::terminated();
-		let target_go_offline_future = futures::future::Fuse::terminated();
 		let target_tick_stream = interval(target_tick).fuse();
 
 		futures::pin_mut!(
@@ -154,7 +201,6 @@ pub fn run<P: HeadersSyncPipeline>(
 			source_orphan_header_future,
 			source_extra_future,
 			source_completion_future,
-			source_go_offline_future,
 			source_tick_stream,
 			target_best_block_future,
 			target_incomplete_headers_future,
@@ -162,11 +208,13 @@ pub fn run<P: HeadersSyncPipeline>(
 			target_existence_status_future,
 			target_submit_header_future,
 			target_complete_header_future,
-			target_go_offline_future,
 			target_tick_stream
 		);
 
 		loop {
+			let source_client_was_online = source_client_is_online;
+			let target_client_was_online = target_client_is_online;
+
 			futures::select! {
 				source_best_block_number = source_best_block_number_future => {
 					source_best_block_number_required = false;
@@ -174,8 +222,6 @@ pub fn run<P: HeadersSyncPipeline>(
 					source_client_is_online = process_future_result(
 						source_best_block_number,
 						|source_best_block_number| sync.source_best_header_number_response(source_best_block_number),
-						&mut source_go_offline_future,
-						|| async_std::task::sleep(CONNECTION_ERROR_DELAY),
 						|| format!("Error retrieving best header number from {}", P::SOURCE_NAME),
 					);
 				},
@@ -183,8 +229,6 @@ pub fn run<P: HeadersSyncPipeline>(
 					source_client_is_online = process_future_result(
 						source_new_header,
 						|source_new_header| sync.headers_mut().header_response(source_new_header),
-						&mut source_go_offline_future,
-						|| async_std::task::sleep(CONNECTION_ERROR_DELAY),
 						|| format!("Error retrieving header from {} node", P::SOURCE_NAME),
 					);
 				},
@@ -192,8 +236,6 @@ pub fn run<P: HeadersSyncPipeline>(
 					source_client_is_online = process_future_result(
 						source_orphan_header,
 						|source_orphan_header| sync.headers_mut().header_response(source_orphan_header),
-						&mut source_go_offline_future,
-						|| async_std::task::sleep(CONNECTION_ERROR_DELAY),
 						|| format!("Error retrieving orphan header from {} node", P::SOURCE_NAME),
 					);
 				},
@@ -201,8 +243,6 @@ pub fn run<P: HeadersSyncPipeline>(
 					source_client_is_online = process_future_result(
 						source_extra,
 						|(header, extra)| sync.headers_mut().extra_response(&header, extra),
-						&mut source_go_offline_future,
-						|| async_std::task::sleep(CONNECTION_ERROR_DELAY),
 						|| format!("Error retrieving extra data from {} node", P::SOURCE_NAME),
 					);
 				},
@@ -210,13 +250,8 @@ pub fn run<P: HeadersSyncPipeline>(
 					source_client_is_online = process_future_result(
 						source_completion,
 						|(header, completion)| sync.headers_mut().completion_response(&header, completion),
-						&mut source_go_offline_future,
-						|| async_std::task::sleep(CONNECTION_ERROR_DELAY),
 						|| format!("Error retrieving completion data from {} node", P::SOURCE_NAME),
 					);
-				},
-				source_client = source_go_offline_future => {
-					source_client_is_online = true;
 				},
 				_ = source_tick_stream.next() => {
 					if sync.is_almost_synced() {
@@ -261,8 +296,6 @@ pub fn run<P: HeadersSyncPipeline>(
 								},
 							}
 						},
-						&mut target_go_offline_future,
-						|| async_std::task::sleep(CONNECTION_ERROR_DELAY),
 						|| format!("Error retrieving best known header from {} node", P::TARGET_NAME),
 					);
 				},
@@ -272,8 +305,6 @@ pub fn run<P: HeadersSyncPipeline>(
 					target_client_is_online = process_future_result(
 						incomplete_headers_ids,
 						|incomplete_headers_ids| sync.headers_mut().incomplete_headers_response(incomplete_headers_ids),
-						&mut target_go_offline_future,
-						|| async_std::task::sleep(CONNECTION_ERROR_DELAY),
 						|| format!("Error retrieving incomplete headers from {} node", P::TARGET_NAME),
 					);
 				},
@@ -283,8 +314,6 @@ pub fn run<P: HeadersSyncPipeline>(
 						|(target_header, target_existence_status)| sync
 							.headers_mut()
 							.maybe_orphan_response(&target_header, target_existence_status),
-						&mut target_go_offline_future,
-						|| async_std::task::sleep(CONNECTION_ERROR_DELAY),
 						|| format!("Error retrieving existence status from {} node", P::TARGET_NAME),
 					);
 				},
@@ -292,8 +321,6 @@ pub fn run<P: HeadersSyncPipeline>(
 					target_client_is_online = process_future_result(
 						target_submit_header_result,
 						|submitted_headers| sync.headers_mut().headers_submitted(submitted_headers),
-						&mut target_go_offline_future,
-						|| async_std::task::sleep(CONNECTION_ERROR_DELAY),
 						|| format!("Error submitting headers to {} node", P::TARGET_NAME),
 					);
 				},
@@ -301,8 +328,6 @@ pub fn run<P: HeadersSyncPipeline>(
 					target_client_is_online = process_future_result(
 						target_complete_header_result,
 						|completed_header| sync.headers_mut().header_completed(&completed_header),
-						&mut target_go_offline_future,
-						|| async_std::task::sleep(CONNECTION_ERROR_DELAY),
 						|| format!("Error completing headers at {}", P::TARGET_NAME),
 					);
 				},
@@ -312,13 +337,8 @@ pub fn run<P: HeadersSyncPipeline>(
 						|(header, extra_check_result)| sync
 							.headers_mut()
 							.maybe_extra_response(&header, extra_check_result),
-						&mut target_go_offline_future,
-						|| async_std::task::sleep(CONNECTION_ERROR_DELAY),
 						|| format!("Error retrieving receipts requirement from {} node", P::TARGET_NAME),
 					);
-				},
-				target_client = target_go_offline_future => {
-					target_client_is_online = true;
 				},
 				_ = target_tick_stream.next() => {
 					target_best_block_required = true;
@@ -419,6 +439,8 @@ pub fn run<P: HeadersSyncPipeline>(
 				} else {
 					target_client_is_online = true;
 				}
+			} else if target_client_was_online {
+				return Err(Error::Target);
 			}
 
 			// If the source client is accepting requests we update the requests that
@@ -477,7 +499,7 @@ pub fn run<P: HeadersSyncPipeline>(
 							P::SOURCE_NAME,
 							P::TARGET_NAME,
 						);
-						return;
+						return Err(Error::Fatal);
 					}
 
 					log::debug!(
@@ -500,9 +522,11 @@ pub fn run<P: HeadersSyncPipeline>(
 				} else {
 					source_client_is_online = true;
 				}
+			} else if source_client_was_online {
+				return Err(Error::Source);
 			}
 		}
-	});
+	})
 }
 
 /// Stream that emits item every `timeout_ms` milliseconds.
@@ -518,36 +542,24 @@ fn interval(timeout: Duration) -> impl futures::Stream<Item = ()> {
 /// Returns whether or not the client we're interacting with is online. In this context
 /// what online means is that the client is currently not handling any other requests
 /// that we've previously sent.
-fn process_future_result<TResult, TError, TGoOfflineFuture>(
+fn process_future_result<TResult, TError>(
 	result: Result<TResult, TError>,
 	on_success: impl FnOnce(TResult),
-	go_offline_future: &mut std::pin::Pin<&mut futures::future::Fuse<TGoOfflineFuture>>,
-	go_offline: impl FnOnce() -> TGoOfflineFuture,
 	error_pattern: impl FnOnce() -> String,
 ) -> bool
 where
 	TError: std::fmt::Debug + MaybeConnectionError,
-	TGoOfflineFuture: FutureExt,
 {
-	let mut client_is_online = false;
-
 	match result {
 		Ok(result) => {
 			on_success(result);
-			client_is_online = true
+			true
 		}
 		Err(error) => {
-			if error.is_connection_error() {
-				go_offline_future.set(go_offline().fuse());
-			} else {
-				client_is_online = true
-			}
-
 			log::error!(target: "bridge", "{}: {:?}", error_pattern(), error);
+			!error.is_connection_error()
 		}
 	}
-
-	client_is_online
 }
 
 /// Print synchronization progress.

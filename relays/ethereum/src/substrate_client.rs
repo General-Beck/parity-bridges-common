@@ -82,6 +82,8 @@ impl Default for SubstrateSigningParams {
 
 /// Substrate client type.
 pub struct SubstrateRpcClient {
+	/// Substrate node connection params.
+	params: SubstrateConnectionParams,
 	/// Substrate RPC client.
 	client: Client,
 	/// Genesis block hash.
@@ -99,7 +101,22 @@ impl SubstrateRpcClient {
 		let number: Number = Zero::zero();
 		let genesis_hash = Substrate::chain_get_block_hash(&client, number).await?;
 
-		Ok(Self { client, genesis_hash })
+		Ok(Self { params, client, genesis_hash })
+	}
+
+	/// Reconnect to the Ethereum node.
+	pub fn reconnect(self) -> Self {
+		Self::with_genesis_hash(self.params, self.genesis_hash)
+	}
+
+	/// Creates Substrate RPC client with given genesis hash.
+	fn with_genesis_hash(params: SubstrateConnectionParams, genesis_hash: H256) -> Self {
+		let uri = format!("http://{}:{}", params.host, params.port);
+		let transport = HttpTransportClient::new(&uri);
+		let raw_client = RawClient::new(transport);
+		let client: Client = raw_client.into();
+
+		Self { params, client, genesis_hash }
 	}
 }
 
